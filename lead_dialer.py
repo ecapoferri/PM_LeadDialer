@@ -269,6 +269,39 @@ def term_handler(signal_num, frame) -> None:
     exit(0)
 
 
+def url_constr(df_: Df) -> list[str]:
+    urls: list[str] = []
+
+    for r in df_.itertuples():
+        lid = str(r.lead_id)
+        fn = str(r.name_first)
+        ln = str(r.name_last)
+        ph = str(r.phone)
+        co = str(r.company)
+        em = str(r.email)
+        ws = str(r.website)
+        cmt = str(r.comment)
+        sc = str(r.lead_source)
+
+        # some args are quote_plus, some are inside double quotes
+        # this also elims the need for urllib.parse.urlencode
+        api_args.update({
+            'phone_number': ph,
+            'first_name': fn.replace(' ', '+'),
+            'last_name': ln.replace(' ', '+'),
+            'MMS_Lead_ID': lid,
+            'Company_Name': co.replace(' ', '+'),
+            'email': f'"{em}"',
+            'Lead_Source': sc.replace(' ', '+'),
+            'Website': f'"{ws}"',
+            'comments': cmt.replace(' ', '+')
+        })
+
+        urls.append(query_url(api_url=api_url, args=api_args))
+
+    return urls
+
+
 def main():
     global last_str
     signal.signal(signal.SIGTERM, term_handler)
@@ -315,37 +348,9 @@ def main():
 
             if len(results):
                 results = results.fillna('<Blank>').astype('string')
-                for r in results.itertuples():
-                    lid = str(r.lead_id)
-                    fn = str(r.name_first)
-                    ln = str(r.name_last)
-                    ph = str(r.phone)
-                    co = str(r.company)
-                    em = str(r.email)
-                    ws = str(r.website)
-                    cmt = str(r.comment)
-                    sc = str(r.lead_source)
 
-                    # some args are quote_plus, some are inside double quotes
-                    # this also elims the need for urllib.parse.urlencode
-                    api_args.update({
-                        'phone_number': ph,
-                        'first_name': fn.replace(' ', '+'),
-                        'last_name': ln.replace(' ', '+'),
-                        'MMS_Lead_ID': lid,
-                        'Company_Name': co.replace(' ', '+'),
-                        'email': f'"{em}"',
-                        'Lead_Source': sc.replace(' ', '+'),
-                        'Website': f'"{ws}"',
-                        'comments': cmt.replace(' ', '+')
-                    })
-
-                    url: str = query_url(api_url=api_url, args=api_args)
-                    logger.debug(f"{url}")
-                    # response = requests.get(url)
-                    # logger.info(f"response")
-
-                    del url  #, response
+            url_list = url_constr(results)
+            
 
             # set min timestamp for next run
             environ['pm_diallead_lastrefr'] = last_str = now.strftime(sql_ts_fmt)
