@@ -7,16 +7,18 @@ from io import StringIO
 from os import environ
 from pathlib import Path
 from time import sleep
+from urllib.parse import quote_plus, urlencode
+import re
 
 import pandas as pd
 import pytz
 import requests
-
 from pandas import DataFrame as Df
 from tqdm import tqdm
 
 from db_engines import mms_db as db
 
+from typing import Iterable
 
 
 # %% input config ===================>
@@ -24,6 +26,10 @@ from db_engines import mms_db as db
 starting_line = '2022-11-14 17:00:00'
 # time in seconds to check db
 refresh_secs = 600
+# list of lead sources to filter for
+results_filt: dict[str, list[str]] = {
+    'lead_source': ['Google Paid Search']
+}
 
 lead_sql: str = """--sql
     SELECT
@@ -88,6 +94,11 @@ lead_sql: str = """--sql
 # == input config ===================<
 
 # %% hard code config ==========================>
+# for url formatting
+quote_safe = '='
+quote_reg = lambda s: quote_plus(s, safe=quote_safe)  # regular encoding
+quote_quote = lambda s: f'"{s}"'  # website and email encoding, straight string in double quotes
+
 sql_ts_fmt = fmt_lg_ts = r'%Y-%m-%d %H:%M:%S'
 tz_local = pytz.timezone('US/Central')
 
@@ -124,6 +135,7 @@ fmt_lg_prfx = '[%(asctime)s||%(name)s:%(module)s:%(funcName)s||%(levelname)s]'
 fmt_lg_msg = ' >> %(message)s'
 
 we_are_debugging = True
+testing_url_format = True
 # <== logging config =====================<
 
 # == HTTP REQUEST URL CONFIG ===========>
@@ -154,7 +166,7 @@ we_are_debugging = True
         comments=interested+in+=+tv+advertising  # QUOTE_PLUS STYLE
 """
 api_url = 'https://vici2201.theprimediagroup.com/vicidial/non_agent_api.php'
-api_args: dict[str, str] = {
+param_args: dict[str, str] = {
     # STATIC ARGS:
     'source': 'test',
     'user': '6666',
@@ -174,8 +186,6 @@ api_args: dict[str, str] = {
     'Website': '',
     'comments': ''
 }
-# fields that need a double quote string rather than spaces repalaced with '+'
-quote_fields: list[str] = ['email', 'Website']
 # fields to update for urlencode
 fields_to_fill: list[str] = [
     'phone_number',
@@ -187,6 +197,13 @@ fields_to_fill: list[str] = [
     'Lead_Source',
     'Website',
     'comments'
+]
+# fields that need a double quote string rather than spaces repalaced with '+'
+dblquote_params: list[str] = ['email', 'Website']
+quote_params: list[str] = [
+    s for s in param_args.keys()
+    # exlude pre defined fields and dbl qoulte fields
+    if (not s in dblquote_params) & (s in fields_to_fill)
 ]
 #<== HTTP REQUEST URL CONFIG <=========<
 
@@ -240,7 +257,7 @@ def logger_setup(debugging: bool=False, log_reset: bool=False) -> logging.Logger
     return logger_
 
 
-def query_url(api_url: str, args: dict, qmark: bool = True) -> str:
+def query_url(api_url: str, args_dict: dict, qmark: bool = True) -> str:
     """Assembles url with api parameters
 
     Args:
@@ -258,7 +275,29 @@ def query_url(api_url: str, args: dict, qmark: bool = True) -> str:
     q: str = '?' if qmark else ''
     # f_args_str: str = urlencode(args)
     f_args_str: str = '&'.join([
-        f"{k}={v}" for k, v in args.items()
+        f"{k}={v}" for k, v in args_dict.items()
+    ])
+    return f"{api_url}{q}{f_args_str}"
+
+
+def query_url_A(
+    api_url: str,
+    arg_dict: dict,
+    quote_params: Iterable[str],
+    not_quote_params: Iterable[str],
+    quote_norm,
+    ampersand: bool=True,
+    qmark: bool=True
+) -> str:
+
+    q: str = '?' if qmark else ''
+    amp: str = '&' if ampersand else ''
+
+    # f_args_str: str = urlencode(args)
+    f_args_str: str = amp.join([
+        f"{k}={quote_norm(v)}" if k in quote_params
+        else f"{k}={v}"
+        for k, v in arg_dict.items()
     ])
     return f"{api_url}{q}{f_args_str}"
 
@@ -269,46 +308,51 @@ def term_handler(signal_num, frame) -> None:
     exit(0)
 
 
-def url_constr(df_: Df) -> list[str]:
+def url_constr_A(df_: Df, api_args: dict[str, str]) -> list[str]:
     urls: list[str] = []
 
     for r in df_.itertuples():
-        lid = str(r.lead_id)
-        fn = str(r.name_first)
-        ln = str(r.name_last)
-        ph = str(r.phone)
-        co = str(r.company)
-        em = str(r.email)
-        ws = str(r.website)
-        cmt = str(r.comment)
-        sc = str(r.lead_source)
 
         # some args are quote_plus, some are inside double quotes
         # this also elims the need for urllib.parse.urlencode
         api_args.update({
-            'phone_number': ph,
-            'first_name': fn.replace(' ', '+'),
-            'last_name': ln.replace(' ', '+'),
-            'MMS_Lead_ID': lid,
-            'Company_Name': co.replace(' ', '+'),
-            'email': f'"{em}"',
-            'Lead_Source': sc.replace(' ', '+'),
-            'Website': f'"{ws}"',
-            'comments': cmt.replace(' ', '+')
+            # no url encoding
+            'MMS_Lead_ID': str(r.lead_id),
+            'phone_number': str(r.phone), 
+
+            # regular quote_plus, '=' ok
+            'first_name': str(r.name_first),
+            'last_name': str(r.name_last),
+            'Company_Name': str(r.company),
+            'Lead_Source': str(r.lead_source),
+            'comments': re.sub(r'-+', '\n', str(r.comment)),
+
+            # bare string within ""
+            # removes '-' lines from comments
+            'Website': str(r.website),
+            'email': str(r.email),
         })
 
-        urls.append(query_url(api_url=api_url, args=api_args))
+        urls.append(
+            query_url_A(
+                api_url=api_url,
+                arg_dict=api_args,
+                quote_params=quote_params,
+                not_quote_params=dblquote_params,
+                quote_norm=lambda s: quote_plus(s, safe=quote_safe)
+        ))
 
     return urls
 
 
-def main():
-    global last_str
+
+def main(last_str: str):
     signal.signal(signal.SIGTERM, term_handler)
 
     logger = logger_setup(debugging=we_are_debugging)
     logger.info(f"Let's go!")
     logger.debug(f"Debugging...")
+    if testing_url_format: logger.debug(f"***Testing URL construction only. No HTTP requests will be executed.***")
 
     logger.info(f"Starting this run at (UTC) {datetime.utcnow().strftime(sql_ts_fmt)}")
     logger.info(f"Starting mininum datetime (UTC): {last_str}")
@@ -316,12 +360,16 @@ def main():
     try:
         while True:
             # clear any values that may be lagging from the previous itteration
-            api_args.update({
+            param_args.update({
                 k: '' for k in fields_to_fill
             })
 
             # strings for sql query, converted to utc
             last_str = environ['pm_diallead_lastrefr']
+
+
+
+
             now = datetime.utcnow().astimezone(pytz.utc)
 
             query: str = lead_sql.format(last_str=last_str)
@@ -335,36 +383,60 @@ def main():
                     results = (
                         pd.read_sql_query(query, conn)
                     )
+                logger.debug(f"results df: len, {len(results)}")
+                log_buf = StringIO()
+                results.info(buf=log_buf)
+                logger.debug(f"Query results df, info:\n{log_buf.getvalue()}")
+
             except Exception:
                 logger.error(
-                    f"There was an error querying results for {last_str} - {now.strftime(sql_ts_fmt)} \n\n{traceback.format_exc()}")
+                    f"There was an error querying querying DB:\n\n{traceback.format_exc()}")
 
-            logger.debug(f"results df: len, {len(results)}")
-            log_buf = StringIO()
-            results.info(buf=log_buf)
-            logger.info(f"Query results df, info:\n{log_buf.getvalue()}")
+            del query
 
-            del query, log_buf
+            if not len(results):
+                logger.info(f"No New Results from DB query.")
+            else: 
+                results = results.fillna(r'').astype('string')
 
-            if len(results):
-                results = results.fillna('<Blank>').astype('string')
+                for col, lst in results_filt.items():
+                    results = results.loc[results[col].isin(lst)]
 
-            url_list = url_constr(results)
-            
+                if not len(results):
+                    logger.info(f"No Results within filter conditions")
+                else:
+                    url_list = url_constr_A(results, param_args)
 
-            # set min timestamp for next run
-            environ['pm_diallead_lastrefr'] = last_str = now.strftime(sql_ts_fmt)
+                    if not len(url_list):
+                        logger.error(f"No urls processed!")
+                    else:
+                        # FIXME: make these async requests
+                        for u in url_list:
+                            response = requests.Response()
+                            log_msg = f"\n\t{'[URL]': >6}"+"\t{u}\n\t"+f"{'[Resp]': >6}\t"+"{response}"
+                            try:
+                                response = requests.Response() if testing_url_format else requests.get(u)
+                                logger.info(
+                                    log_msg.format(
+                                        u=u,
+                                        response=response if not testing_url_format else 'TESTING, NO REQUEST SENT'
+                                ))
+                            except Exception:
+                                logger.error(
+                                    f"""ERROR ON:{log_msg.format(u=u, response=response)}
 
-            if we_are_debugging:
-                logger.debug(f"Refreshing in {str(refresh.seconds)} secs...")
-                for _ in tqdm(range(refresh.seconds)):
-                    sleep(1)
-            else:
-                sleep(refresh.seconds)
+                                    SEE TRACEBACK BELOW:
+
+                                    {traceback.format_exc()}"""
+                                    .replace('                            ', '')
+                                )
+
+                # set min timestamp for next run, only updated if run pulls results
+                environ['pm_diallead_lastrefr'] = last_str = now.strftime(sql_ts_fmt)
 
 
     except KeyboardInterrupt:
-        logger.error("Interrupt detected - BYE!")
+        logger.info("Interrupt detected - BYE!")
     except Exception:
         logger.error(traceback.format_exc())
     finally:
@@ -376,4 +448,4 @@ def main():
 
 # %% # GO!
 if __name__ == "__main__":
-    main()
+    main(last_str=last_str)
