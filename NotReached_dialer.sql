@@ -39,18 +39,9 @@ FROM
     ) web ON web.lid = l.id
 
     LEFT JOIN (
-        SELECT lead_id, value val, MAX(modified) FROM (
-                SELECT lead_id, value, modified
-                FROM lead_data
-                WHERE
-                    lead_field_id = 35
-                    OR
-                    lead_field_id = 39
-            UNION
-                SELECT id lead_id, vertical value, modified
-                FROM lead
-        ) src_sub
-        GROUP BY lead_id
+        SELECT lead_id lid, value val
+        FROM lead_data
+        WHERE lead_field_id = 39
     ) vert
         ON l.id = vert.lead_id
 

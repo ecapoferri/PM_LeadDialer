@@ -1,170 +1,65 @@
-# %% IMPORTS
+"""
+Generalized module to send dmp/lead query results to vici dialer
+"""
 import logging
-import signal
 import traceback
 from datetime import datetime, timedelta
 from io import StringIO
-from os import environ
 from pathlib import Path
-from time import sleep
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus
 import re
 
 import pandas as pd
-import pytz
 import requests
 from pandas import DataFrame as Df
-from tqdm import tqdm
 
 from db_engines import mms_db as db
 
 from typing import Iterable
 
 
-# %% input config ===================>
-trailing_days = 185
 
-# list of lead sources to filter for
-results_filt: dict[str, list[str]] = {
-    'lead_source': ['Google Paid Search']
-}
+def logger_setup(top_logger_name: str, debugging: bool=False, log_reset: bool=False) -> logging.Logger:
+    ANSILG = '\x1b[93m'
+    ANSIRST = '\x1b[0m'
+    FMT_LG_TS = r'%Y-%m-%d %H:%M:%S'
+    FMT_LG_PRFX = '[%(asctime)s||%(name)s:%(module)s:%(funcName)s||%(levelname)s]'
+    FMT_LG_MSG = ' >> %(message)s'
 
-lead_sql: str = re.sub(
-    pattern=r'LIMIT \d*\n',
-    repl='\n',
-    string=re.sub(
-        pattern=r'WHERE l\.created.*\n',
-        repl="WHERE l.created >= '{min_date_str}'\n",
-        string=Path('NotReached_dialer.sql').read_text()
-    )
-)
-
-
-# Set to True to print debugging messages to stdout
-we_are_debugging = True
-# Set to True to avoid sending actual http requests, useful for debugging
-# default should be False
-testing_url_format = True
-# == input config ===================<
-
-# %% hard code config ==========================>
-# for url formatting
-quote_safe = '='  # character(s) to exclude in url encoding
-# function to pass to url builder for regular encoding
-quote_reg = lambda s: quote_plus(s, safe=quote_safe)
-# ditto for website and emails as url args, straight string in double quotes
-quote_quote = lambda s: f'"{s}"'
-
-sql_ts_fmt = fmt_lg_ts = r'%Y-%m-%d %H:%M:%S'
-tz_local = pytz.timezone('US/Central')
-
-# first min datetime
-now = datetime.now(tz=tz_local)
-min_date_local = datetime(
-        year=now.year,
-        month=now.month,
-        day=now.day,
-        tzinfo=now.tzinfo
-    ) - timedelta(days=trailing_days)
-del now
-
-min_date = min_date_local.astimezone(pytz.utc)
-min_date_str: str = min_date.strftime(sql_ts_fmt)
-
-# mininum time to allow for refreshes
-refresh_min = 60
-
-# logging config ==========================>
-logger_top_name = 'NotReached_dialer'
-
-log_file_name = Path(f"{__file__}-INFO.log")
-
-ansilg = '\x1b[93m'
-ansirst = '\x1b[0m'
-fmt_lg_ts = r'%Y-%m-%d %H:%M:%S'
-fmt_lg_prfx = '[%(asctime)s||%(name)s:%(module)s:%(funcName)s||%(levelname)s]'
-fmt_lg_msg = ' >> %(message)s'
-
-ansi_green = '\x1b[32m'
-confirm_log_msg = \
-    f"\n{ansi_green}\t{'[URL]': >6}{ansirst}"+\
-    "\t{u}"+\
-    f"\n{ansi_green}\t{'[Resp]': >6}{ansirst}"+\
-    "\t{response}\n"
-
-# <== logging config =====================<
-
-# == HTTP REQUEST URL CONFIG ===========>
-api_url = 'http://10.1.10.20/vicidial/non_agent_api.php'
-
-# these args stay the same for each url
-api_static_args: dict[str, str] = {
-    'source': 'test',
-    'user': '6666',
-    'pass': 'RedLakeSky3501',
-    'function': 'add_lead',
-    'list_id': '104',
-    'custom_fields': 'Y',
-    'duplicate_check': 'DUPLIST30DAY',
-}
-# fields to update for each loop
-variable_args: list[str] = [
-    'phone_number',
-    'MMS_Lead_ID',
-    'Company_Name',
-    'Lead_Source',
-    'Website',
-    'Lead_Owner',
-    'Vertical',
-    'Media_Market',
-    'first_name'
-]
-
-# fields that need a double quote string rather than spaces repalaced with '+'
-# 'Lead_Source' may need to be included here
-dblquote_params: list[str] = ['Website']
-quote_params: list[str] = [
-    s for s in variable_args
-    # exlude pre defined fields and dbl qoulte fields
-    # static args
-    if (not s in dblquote_params) & (s in variable_args)
-]
-#<== HTTP REQUEST URL CONFIG <=========<
-
-#<== hard code config <=========================<
-
-
-
-# %% fns
-def logger_setup(debugging: bool=False, log_reset: bool=False) -> logging.Logger:
+    log_file = Path(f"{__file__}-INFO.log")
 
     if log_reset:
-        log_file_name.write_text('', encoding='utf-8')
+        log_file.write_text('', encoding='utf-8')
 
-    fmt_lg_strm = f"{ansilg}{fmt_lg_prfx}{ansirst}{fmt_lg_msg}"
-    fmt_lg_file = f"{fmt_lg_prfx}{fmt_lg_msg}"
+    fmt_lg_strm = f"{ANSILG}{FMT_LG_PRFX}{ANSIRST}{FMT_LG_MSG}"
+    fmt_lg_file = f"{FMT_LG_PRFX}{FMT_LG_MSG}"
 
     fmtr_strm: logging.Formatter
     fmtr_file: logging.Formatter
-    fmtr_strm, fmtr_file = (logging.Formatter(fmt=f, datefmt=fmt_lg_ts) for f in (fmt_lg_strm, fmt_lg_file))
+    fmtr_strm, fmtr_file = (
+        logging.Formatter(
+            fmt=f,
+            datefmt=FMT_LG_TS,
+        )
+        for f in (fmt_lg_strm, fmt_lg_file))
 
     hdlr_strm: logging.Handler = logging.StreamHandler()
-    hdlr_file: logging.Handler = logging.FileHandler(log_file_name, encoding='utf-8')
+    hdlr_file: logging.Handler = logging.FileHandler(log_file, encoding='utf-8')
     hdlr_file.setLevel(logging.INFO)
 
     output_lvl: int = logging.DEBUG if debugging else logging.INFO
 
 
     fmtrs = (
-            (hdlr_strm, fmtr_strm),
-            (hdlr_file, fmtr_file)
-        )
+        (hdlr_strm, fmtr_strm),
+        (hdlr_file, fmtr_file),
+    )
 
     for hdlr, fmtr in fmtrs:
         hdlr.setFormatter(fmtr)
     del fmtrs
 
-    logger_ = logging.getLogger(logger_top_name)
+    logger_ = logging.getLogger(top_logger_name)
 
     for h in hdlr_strm, hdlr_file:
         logger_.addHandler(h)
@@ -175,17 +70,38 @@ def logger_setup(debugging: bool=False, log_reset: bool=False) -> logging.Logger
 
 
 def query_url(
-    api_url: str,
-    arg_dict: dict,
-    quote_params: Iterable[str],
-    not_quote_params: Iterable[str],
-    quote_norm,
-    ampersand: bool=True,
-    qmark: bool=True
-) -> str:
+            api_url: str,
+            arg_dict: dict,
+            quote_params: Iterable[str],
+            quote_safe: str,
+            dblquote_params: Iterable[str],
+            ampersand: bool=True,
+            qmark: bool=True,
+        ) -> str:
+
+    quote_norm = lambda s: quote_plus(s, safe=quote_safe)
+    dblquote = lambda s: f'"{s}"'
 
     q: str = '?' if qmark else ''
     amp: str = '&' if ampersand else ''
+
+    args_strings: list[str] = []
+
+    for k in quote_params:
+        args_strings.append(f"{k}={quote_norm(arg_dict[k])}")
+
+    for k in dblquote_params:
+        args_strings.append(f"{k}={dblquote(arg_dict[k])}")
+
+    the_rest = [
+        k for k in arg_dict.keys()
+        if k not in quote_params and k not in dblquote_params
+    ]
+    if the_rest:
+        for k in the_rest:
+            args_strings.append(f"{k}={arg_dict[k]}")
+
+
 
     # f_args_str: str = urlencode(args)
     f_args_str: str = amp.join([
@@ -196,13 +112,13 @@ def query_url(
     return f"{api_url}{q}{f_args_str}"
 
 
-def term_handler(signal_num, frame) -> None:
-    lggr = logging.getLogger(logger_top_name)
-    lggr.error(f"SIGTERM detected, BYE!")
-    exit(0)
-
-
-def url_builder(df_: Df, api_args_static: dict[str, str]) -> list[str]:
+def url_builder(
+            df_: Df, api_args_static: dict[str, str|int],
+            api_url: str,
+            quote_params: Iterable[str],
+            dblquote_params: Iterable[str],
+            quote_safe: str,
+        ) -> list[str]:
     """spits out list of full url string
 
     Args:
@@ -237,6 +153,8 @@ def url_builder(df_: Df, api_args_static: dict[str, str]) -> list[str]:
             'first_name': str(r.name_)
         }
 
+
+
         # combine with recurring args
         api_args = api_args_static | args
 
@@ -245,30 +163,101 @@ def url_builder(df_: Df, api_args_static: dict[str, str]) -> list[str]:
                 api_url=api_url,
                 arg_dict=api_args,
                 quote_params=quote_params,
-                not_quote_params=dblquote_params,
-                quote_norm=lambda s: quote_plus(s, safe=quote_safe)
+                dblquote_params=dblquote_params,
+                quote_safe=quote_safe,
         ))
 
     return urls
 
 def main():
-    logger = logger_setup(debugging=we_are_debugging, log_reset=True)
+    # Set to True to print debugging messages to stdout
+    WE_ARE_DEBUGGING = True
+    # Set to True to avoid sending actual http requests, useful for debugging
+    # default should be False
+    TESTING_URL_FORMAT = True
+    # == input config ===================<
+
+    LIST_ID = 104
+
+    LOGGER_TOP_NAME = 'NotReached_dialer'
+
+    SQL_SRC_FN = 'NotReached_dialer.sql'
+
+    # list of lead sources to filter for
+
+    lead_sql: str = re.sub(
+        pattern=r'LIMIT \d*\n',
+        repl='\n',
+        string=re.sub(
+            pattern=r'WHERE l\.created.*\n',
+            repl="WHERE l.created >= '{min_date_str}'\n",
+            string=Path(SQL_SRC_FN).read_text()
+        )
+    )
+
+
+    # for url formatting
+    QUOTE_SAFE = '='  # character(s) to exclude in url encoding
+
+    # for logging messages
+    ANSIRST = '\x1b[0m'
+    ANSI_GREEN = '\x1b[32m'
+    confirm_log_msg = \
+        f"\n{ANSI_GREEN}\t{'[URL]': >6}{ANSIRST}"\
+        + "\t{u}"\
+        + f"\n{ANSI_GREEN}\t{'[Resp]': >6}{ANSIRST}"\
+        + "\t{response}\n"
+
+    API_URL = 'http://10.1.10.20/vicidial/non_agent_api.php'
+
+    # these args stay the same for each url
+    API_STATIC_ARGS: dict[str, str|int] = {
+        'source': 'test',
+        'user': '6666',
+        'pass': 'RedLakeSky3501',
+        'function': 'add_lead',
+        'list_id': str(LIST_ID),
+        'custom_fields': 'Y',
+        'duplicate_check': 'DUPLIST30DAY',
+    }
+    # fields to update for each loop
+    VARIABLE_ARGS: list[str] = [
+        'phone_number',
+        'MMS_Lead_ID',
+        'Company_Name',
+        'Lead_Source',
+        'Website',
+        'Lead_Owner',
+        'Vertical',
+        'Media_Market',
+        'first_name'
+    ]
+
+    # fields that need a double quote string rather than spaces repalaced with '+'
+    # 'Lead_Source' may need to be included here
+    DBLQUOTE_PARAMS: list[str] = ['Website']
+    quote_params: list[str] = [
+        s for s in VARIABLE_ARGS
+        # exlude pre defined fields and dbl qoulte fields
+        # static args
+        if (not s in DBLQUOTE_PARAMS)
+    ]
+
+    logger = logger_setup(top_logger_name=LOGGER_TOP_NAME, debugging=WE_ARE_DEBUGGING, log_reset=True)
     logger.info(f"Let's go!")
     logger.debug(f"Debugging...")
-    if testing_url_format: logger.debug(f"***Testing URL construction only. No HTTP requests will be executed.***")
+    if TESTING_URL_FORMAT: logger.debug(
+        f"***Testing URL construction only. No HTTP requests will be executed.***")
 
-    logger.info(f"Starting at {min_date_str} UTC, ({min_date_local.strftime(sql_ts_fmt)} US/Central)")
     try:
-        logger.debug(f"min datetime (utc time, tz naive, string): {min_date_str}")
         # plug minimum date into query
-        query: str = lead_sql.format(min_date_str=min_date_str)
         # logger.debug(query)
 
         # extract from DB
         results: Df
         with db.connect() as conn:
             results = (
-                pd.read_sql_query(query, conn)
+                pd.read_sql_query(lead_sql, conn)
             )
         logger.debug(f"results df: len, {len(results)}")
         log_buf = StringIO()
@@ -278,36 +267,67 @@ def main():
         if not len(results):
             logger.error(f"No Results within filter conditions")
         else:
-            url_list = url_builder(results, api_static_args)
+            url_list = url_builder(
+                df_=results,
+                api_args_static=API_STATIC_ARGS,
+                api_url=API_URL,
+                quote_params=quote_params,
+                dblquote_params=DBLQUOTE_PARAMS,
+                quote_safe=QUOTE_SAFE
+            )
 
             if not len(url_list):
                 logger.error(f"No urls processed!")
             else:
+                count_success = 0
+                count_api_error = 0
+                count_duplicates = 0
+                count_bad_request = 0
+
                 # FIXME: make these async requests
                 for u in url_list:
                     response = requests.Response()
                     try:
-                        response = requests.Response() if testing_url_format else requests.get(u)
+                        response = requests.Response() if TESTING_URL_FORMAT else requests.get(u)
 
                         # format response text for logging messages, the html confirmation for 200s has a return in it
-                        resp_log = f"resp: ({response.status_code}) >> {response.text}".replace('\n', '-|')
 
-                        logger.info(
-                            confirm_log_msg.format(
+                        if response.status_code != 200:
+                            logger.error(f"BAD REQUEST - resp: ({response.status_code}")
+                            count_bad_request += 1
+
+                        else:
+                            resp_log = f"resp: ({response.status_code}) >> {response.text}".replace('\n', '-|')
+
+                            log_msg = confirm_log_msg.format(
                                 u=u,
-                                response=resp_log if not testing_url_format
-                                    else 'TESTING, NO REQUEST SENT'
-                        ))
+                                response=resp_log if not TESTING_URL_FORMAT
+                                else 'TESTING, NO REQUEST SENT'
+                            )
+
+                            if re.findall(r'SUCCESS:', response.text):
+                                count_success += 1
+
+                            elif re.findall(r'ERROR:', response.text):
+                                count_api_error += 1
+
+                                if re.findall(r'add_lead DUPLICATE PHONE NUMBER IN LIST', response.text):
+                                    count_duplicates += 1
+
+                            logger.debug(log_msg)
+
 
                     except Exception:
                         logger.error(
-                            f"""ERROR ON:{confirm_log_msg.format(u=u, response=response)}
+                            f"""ERROR ON:\n{confirm_log_msg.format(u=u, response=response)}
 
                             SEE TRACEBACK BELOW:
 
                             {traceback.format_exc()}"""
                             .replace('                            ', '')
                         )
+            
+                logger.info(f"Added to Vici Dialer: {count_success}\nNot Added: {count_api_error}/{count_duplicates} dups\nBad HTTP Requests: {count_bad_request}")
 
 
 
