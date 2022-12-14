@@ -8,44 +8,45 @@ Main function will take input of
     - list_label: str - not sure if this is necessary,
         colloquial identifier for the list;
         this will also be helpful for diagnosing traceback
-    TODO: - EXTRA CUSTOM FIELDS?
+    - params to use: list - list of api url parameters to submit with arguments
 
-Main function should perform the following:
-    TODO: load df based on the compiled query
-    TODO: loop over the df and load entries to vici rest api
-    TODO: provide logging feedback
-    TODO: dump df of query results to a unique csv;
+    - load df based on the compiled query
+    - loop over the df and load entries to vici rest api
+    - provide logging feedback
+    - dump df of query results to a unique csv;
         This is because vici will reject results without a valid phone number.
 """
 import logging
-import traceback
 from io import StringIO
 from pathlib import Path
 from urllib.parse import quote_plus
 import re
 
 import pandas as pd
+from pandas import DataFrame as Df
 import numpy as np
 
 import requests
-from pandas import DataFrame as Df
 
 from db_engines import mms_db as DB
 
 from os import environ as os_environ
 from dotenv import load_dotenv
+
+from MySQLdb._exceptions import\
+    OperationalError as MySQLdbOperationalError
+from sqlalchemy.engine.base import Engine as SqlalchemyConnEngine
+from typing import Iterable
+
 load_dotenv()
 
 SQL_SRC_FN = os_environ['PRMDIA_VICI_BASESQL_PATH']
 RE_SUB_PTN_LIMIT = r'\n*ORDER BY.*\n*LIMIT.*\n*;'
 RE_SUB_REPL_LIMIT = '\n\n-- Added lines below\n{}\n;'
 
-LOGGER_TOP_NAME = 'vici_loader'
-#
-lead_sql: str = re.sub(
-    RE_SUB_PTN_LIMIT,
-    RE_SUB_REPL_LIMIT,
-    Path(SQL_SRC_FN).read_text())
+LOGGER_TOP_NAME = os_environ['PRMDIA_VICI_TOP_LOGGER']
+
+BACKUP_FILE_DIR = os_environ['PRMDIA_VICI_LIST_DUMP_DIR_PATH']
 
 # for url formatting
 QUOTE_SAFE = '='  # character(s) to exclude in url encoding
@@ -60,8 +61,7 @@ confirm_log_msg = (
     + "\t{response}\n"
 )
 
-API_URL = 'http://10.1.10.20/vicidial/non_agent_api.php'
-
+API_URL = os_environ['PRMDIA_VICI_API_URL']
 # these args stay the same for each url
 API_STATIC_ARGS_: dict[str, str | int] = {
     'source': 'test',
@@ -72,9 +72,68 @@ API_STATIC_ARGS_: dict[str, str | int] = {
     'duplicate_check': 'DUPLIST30DAY',
 }
 
-# fields to update for each loop
-VARIABLE_ARGS: list[str] = [
+# Parameters that must be included in the http request url:
+STATIC_REQUIRED_ARGS: list[str] = [
+    'list_id',
+    'source',
+]
+VARIABLE_REQUIRED_ARGS: list[str] = [
     'phone_number',
+]
+# fields that need a double quote string rather rather than
+#   plus style url quoted
+DBLQUOTE_PARAMS: list[str] = [
+    'Website',
+    'email',
+]
+
+# This can be used to map query results fields to pair as arguments
+#   with their respective api url parameters.
+PARAM_ARG_FIELDS_MAP: dict[str, str] = {
+    'phone_number': 'phone',
+    'first_name': 'name_first',
+    'last_name': 'name_last',
+    'comments': 'comments',
+    'address1': 'company_address',
+    'address2': 'company_suite',
+    'city': 'company_city',
+    'state': 'company_state',
+    'postal_code': 'company_zip',
+    'MMS_Lead_ID': 'lead_id',
+    'Vertical': 'vertical',
+    'Media_Market': 'market',
+    'Lead_Source': 'lead_source',
+    'Lead_Owner': 'lead_owner',
+    'Company_Name': 'company',
+    'email': 'email',
+    'Website': 'website',
+}
+
+# Two different addresses are queried. One is used to .fillna the other
+COMP_ADDRESS_FIELDS = [
+    'company_address',
+    'company_city',
+    'company_state',
+    'company_zip',
+]
+BUIS_ADDRESS_FIELDS = [
+    'business_address',
+    'business_city',
+    'business_state',
+    'business_zip',
+]
+VICI_MAX_LEN_COMMENTS = 255
+
+ALL_PARAMS: list[str] = [
+    'phone_number',
+    'first_name',
+    'last_name',
+    'comments',
+    'address1',
+    'address2',
+    'city',
+    'state',
+    'postal_code',
     'MMS_Lead_ID',
     'Company_Name',
     'Lead_Source',
@@ -82,112 +141,87 @@ VARIABLE_ARGS: list[str] = [
     'Lead_Owner',
     'Vertical',
     'Media_Market',
-    'first_name',
-    'last_name'
-]
-# fields that need a double quote string rather than spaces repalaced with '+'
-# 'Lead_Source' may need to be included here
-DBLQUOTE_PARAMS: list[str] = [
-    'Website',
-    'email',
 ]
 
 
-def logger_setup(
-            top_logger_name: str,
-            debugging: bool=False,
-            log_reset: bool=True
-        ) -> logging.Logger:
-    ANSILG = '\x1b[93m'
-    ANSIRST = '\x1b[0m'
-    FMT_LG_TS = r'%Y-%m-%d %H:%M:%S'
-    FMT_LG_PRFX = \
-        '[%(asctime)s||%(name)s:%(module)s:%(funcName)s||%(levelname)s]'
-    FMT_LG_MSG = ' >> %(message)s'
+LOGGER = logging.getLogger(LOGGER_TOP_NAME)
 
-    mode = 'w' if log_reset else 'a'
-
-    log_file = Path(f"{__file__}.log")
-
-    fmt_lg_strm = f"{ANSILG}{FMT_LG_PRFX}{ANSIRST}{FMT_LG_MSG}"
-    fmt_lg_file = f"{FMT_LG_PRFX}{FMT_LG_MSG}"
-
-    fmtr_strm: logging.Formatter
-    fmtr_file: logging.Formatter
-    fmtr_strm, fmtr_file = (
-        logging.Formatter(
-            fmt=f,
-            datefmt=FMT_LG_TS,
-        )
-        for f in (fmt_lg_strm, fmt_lg_file))
-
-    hdlr_strm: logging.Handler = logging.StreamHandler()
-    hdlr_file: logging.Handler = logging.FileHandler(
-        log_file, encoding='utf-8', mode=mode)
-    hdlr_file.setLevel(logging.INFO)
-
-    output_lvl: int = logging.DEBUG if debugging else logging.INFO
-
-
-    fmtrs = (
-        (hdlr_strm, fmtr_strm),
-        (hdlr_file, fmtr_file),
-    )
-
-    for hdlr, fmtr in fmtrs:
-        hdlr.setFormatter(fmtr)
-    del fmtrs
-
-    logger_ = logging.getLogger(top_logger_name)
-
-    for h in hdlr_strm, hdlr_file:
-        logger_.addHandler(h)
-
-    logger_.setLevel(output_lvl)
-
-    return logger_
-
-
-def extract_from_db(logger: logging.Logger, query: str) -> Df:
+def extract_from_db(
+            query: str,db: SqlalchemyConnEngine, table_label: str
+        ) -> Df:
     df_: Df
     with DB.connect() as conn:
         df_ = pd.read_sql_query(query, conn)
-    logger.debug(f"df_ df: len, {len(df_)}")
+    LOGGER.debug(f"{table_label}: df_ df: len, {len(df_)}")
     log_buf = StringIO()
     df_.info(buf=log_buf)
-    logger.debug(f"Query df_ df, info:\n{log_buf.getvalue()}")
+    LOGGER.debug(f"{table_label}: Query df_ df, info:\n{log_buf.getvalue()}")
     return df_
 
 
-def api_param_arg_dict(row, static_args: dict) -> dict[str,str]:
+
+def process_df(df_: Df) -> Df:
+
+    df_c = df_.copy()
+    out_cols = [c for c in df_.columns if c not in BUIS_ADDRESS_FIELDS]
+
+    # Fill in missing 'company address';
+    #   essentially unify into one set of fields.
+    # This truth series will limit the records being replaced to
+    #   only where Company Address is completely blank
+    address_truth = (df_c[COMP_ADDRESS_FIELDS]
+                    .isna().all(axis=1))
+    address_zipper = zip(COMP_ADDRESS_FIELDS, BUIS_ADDRESS_FIELDS)
+    for comp, buis in address_zipper:
+        df_c.loc[address_truth, comp] =(
+            df_c.loc[address_truth, comp]
+            .fillna(df_c.loc[address_truth, buis])
+        )
+
+    # Pretty up name fields.
+    for c in 'name_first', 'name_last':
+        df_c[c] = df_c[c].str.title()
+
+    # Replace repeating dashes found sometimes.
+    df_c['comments'] =\
+        df_c['comments'].str.replace(pat=r'-+', repl='-', regex=True)
+    # Trim comments field down to max length for vici.
+    df_c['comments'] = df_c['comments'].str.slice(stop=VICI_MAX_LEN_COMMENTS)
+
+    return df_c[out_cols]
+
+
+def api_param_arg_dict(
+            row: tuple,
+            static_args: dict,
+            param_list: list[str]
+        ) -> dict[str,str]:
     """Constructs a quick dictionary for this job. Used to pass to url
         encoding function
 
     Args:
         row (_type_): A NamedTuple from pandas.dataframe.itertuples
-        static_args (dict): dictionary of args that don't need to be changed.
+        static_args (dict): dictionary of args that don't need to be
+        changed.
 
     Returns:
-        dict[str,str]: Dict of parameters and args all converted to strings.
+        dict[str,str]: Dict of params and args all converted to strings.
     """
-    args = {
-        # no url encoding
-        'phone_number': str(row.phone),
-        'MMS_Lead_ID': str(row.lead_id),
+    if not len(param_list):
+        raise ValueError(
+            f"There are no elements in the list passed: 'param_list'")
 
-        # regular quote_plus, '=' ok
-        'first_name': str(row.name),
-        'last_name': str(row.name),
-        'Company_Name': str(row.company),
-        'Lead_Source': str(row.lead_source),
-        'Lead_Owner': str(row.lead_owner),
-        'Vertical': str(row.vertical),
-        'Media_Market': str(row.market),
+    # Add required paramters to the list
+    param_list += (
+        VARIABLE_REQUIRED_ARGS
+    )
+    # remove any required args to prevent duplicate entries
+    param_list = list(set(param_list))
 
-        # bare string within ""
-        'Website': str(row.website),
-        'email': str(row.email)
-    }
+    args = {}
+    # Extracts each value from the row NamedTuple
+    for p in param_list:
+        args.update({p: str(getattr(row, PARAM_ARG_FIELDS_MAP[p]))})
     api_args = static_args | args
     return api_args
 
@@ -198,18 +232,20 @@ def url_builder_encoder(
         ) -> str:
     q = '?' if q_mark else r''
 
+    params_to_use: list[str] = list(param_args.keys())
+
     # Args for these params need to be the bare string within double quotes
     dblquote_params: list[str] = DBLQUOTE_PARAMS
     # Args for these params should be plus quoted
     encode_params: list[str] = [
-        s for s in VARIABLE_ARGS
+        s for s in params_to_use
         # exlude pre defined fields and dbl qoulte fields
-        # static args
+        #   static args
         if (not s in dblquote_params)
     ]
     # The remaining should only be the static parameters.
     other_params = [
-        param for param in param_args.keys()
+        param for param in params_to_use
         if
             param not in dblquote_params
             and
@@ -218,27 +254,26 @@ def url_builder_encoder(
 
     # Initializing a list to hold individual param=arg pair strings.
     params: list[str] = []
-    for param in dblquote_params:
-        params.append(f'{param}="{param_args[param]}"')
+
+    for param in other_params:
+        if param not in params_to_use: continue
+        params.append(f'{param}={param_args[param]}')
 
     for param in encode_params:
+        if param not in params_to_use: continue
+        # Skip if the arg value is None. phone_number is required
+        if param_args[param] == 'None' and param != 'phone_number': continue
         enc = quote_plus(param_args[param], safe=QUOTE_SAFE)
         params.append(f'{param}={enc}')
 
+    for param in dblquote_params:
+        if param not in params_to_use: continue
+        # Skip if the arg value is None.
+        if param_args[param] == 'None': continue
+        params.append(f'{param}="{param_args[param]}"')
+
     args = ampersand.join(params)
     return f"{base_url}{q}{args}"
-
-
-def api_request(
-            url: str,
-            testing_url_format: bool = False,
-        ) -> requests.Response:
-    if testing_url_format:
-        resp = requests.Response()
-    else:
-        resp = requests.get(url)
-
-    return resp
 
 
 def parse_response_text(
@@ -246,49 +281,72 @@ def parse_response_text(
             counter_array: np.ndarray,
             url_string: str,
             testing_url: bool = False,
-        ) -> tuple[str, np.ndarray]:
-    API_SUCCESS = r'SUCCESS:'
-    API_ERROR = r'ERROR:'
-    API_DUP_ERROR = r'add_lead DUPLICATE PHONE NUMBER IN LIST'
+        ) -> tuple[str, str, np.ndarray]:
+    api_success = r'SUCCESS:'
+    api_error = r'ERROR:'
+    api_dup_error = r'add_lead DUPLICATE PHONE NUMBER IN LIST'
 
-    resp_log = f"resp: ({response.status_code}) >> {response.text}"\
-        .replace('\n', '-|')
+    if not testing_url:
+        resp_log = f"resp: ({response.status_code}) >> {response.text}"\
+            .replace('\n', '-|')
+    else: resp_log = 'TESTING, NO REQUEST SENT'
+
+    if re.findall(api_success, response.text):
+        counter_array[0] += 1
+
+    elif re.findall(api_error, response.text):
+        counter_array[1] += 1
+
+        if re.findall(api_dup_error, response.text):
+            counter_array[2] += 1
 
     msg = confirm_log_msg.format(
         u=url_string,
-        response=resp_log if not testing_url
-        else 'TESTING, NO REQUEST SENT'
-        )
+        response=resp_log 
+    )
 
-
-    if re.findall(API_SUCCESS, response.text):
-        counter_array[0] += 1
-
-    elif re.findall(API_ERROR, response.text):
-        counter_array[1] += 1
-
-        if re.findall(API_DUP_ERROR, response.text):
-            counter_array[2] += 1
-
-
-    return msg, counter_array
+    return msg, resp_log, counter_array
 
 
 def load_to_vici(
             list_id: int, sql_where: str,
             table_label: str,
-            we_are_debugging: bool = False,
+            params_to_use: list[str],
             testing_url_format: bool = False,
         ):
+    """
+    Generalized module to send dmp/lead query results to vici dialer
 
-    logger = logger_setup(
-        top_logger_name=LOGGER_TOP_NAME,
-        debugging=we_are_debugging,
-    )
-    logger.debug(f"Table Label: {table_label}\nWe are debugging, fyi...")
+    Main function will take input of
+        TODO: - EXTRA CUSTOM FIELDS?
+
+
+        - load df based on the compiled query
+        - loop over the df and load entries to vici rest api
+        - provide logging feedback
+        - dump df of query results to a unique csv;
+            This is because vici will reject results
+            without a valid phone number.
+
+
+    Args:
+        list_id (int): Vici list id
+        sql_where (str): WHERE clauses to be added to base SQL query.
+        table_label (str): General Identifier for the specific list
+            being queried from the lead DB.
+        testing_url_format (bool, optional): To disable (if True)
+            actually sending http requests.
+            Useful for reviewing or debugging URL construction.
+            Defaults to False.
+
+    Raises:
+        ValueError: Raised if no results load from the query
+            or there is a problem constructing urls.
+    """
+    LOGGER.debug(f"Table Label: {table_label}\n\tWe are debugging, fyi...")
     if testing_url_format:
-        logger.debug(
-            f"***Testing URL construction only. No HTTP requests will be executed.***")
+        LOGGER.debug(f"***Testing URL construction only. "
+            + f"No HTTP requests will be executed.***")
 
     # Add list ID to reusable args.
     api_static_args = API_STATIC_ARGS_ | {'list_id': str(list_id), }
@@ -299,92 +357,141 @@ def load_to_vici(
     sql_base = re.sub(RE_SUB_PTN_LIMIT, RE_SUB_REPL_LIMIT, sql_base_)
     # del sql_base_
     query = sql_base.format(sql_where)
-    if we_are_debugging == 0:
-        logger.debug(f"The query:\n")
-        print(query)
 
-    # extract df from DB
-    results = extract_from_db(logger=logger, query=query)
+    # Extract df from DB and do some cleanup.
+    results = (
+        extract_from_db(query=query, db=DB, table_label=table_label)
+        .pipe(process_df)
+    )
     if not len(results):
-        logger.error(f"No Results within filter conditions on this query")
-        return
+        LOGGER.error(
+            f"{table_label}: No Results within filter conditions on this query")
+        raise ValueError(f"No ")
 
+    LOGGER.info(f"{len(results.index)} loaded from DB for {table_label}")
+
+    # Build list of URLs based on df values.
     # initialize the list to fill
-    url_list: list[str] = []
+    url_list: list[tuple[int, str]] = []
     for r in results.itertuples():
-        args = api_param_arg_dict(row=r, static_args=api_static_args)
+        idx: int = r.Index
+        args = api_param_arg_dict(
+            row=r, static_args=api_static_args,
+            param_list=params_to_use
+        )
         url = url_builder_encoder(base_url=API_URL, param_args=args)
-        url_list.append(url)
-    # logger.debug('\n'.join(url_list))
+        url_list.append((idx, url))
 
     if not len(url_list):
-        logger.error(f"No urls processed from results?!")
-        raise ValueError(f"No URLs processed")
+        LOGGER.error(f"{table_label}: No urls processed from results?!")
+        raise ValueError(f"{table_label}: No URLs processed")
 
     # Starting counters to summarize request responses.
-    # count_success, count_api_error, count_duplicates, count_bad_request
+    #   count_success, count_api_error, count_duplicates, count_bad_request
     counters = np.array([0,0,0,0])
-
-    for url in url_list:
+    # Start a list of dispos to join back to the df for backup
+    dispositions: dict[int, tuple[str]] = {}
+    for idx, url in url_list:
         # Initialize the response variable to an empty requests.Response
         #   in case the request function fails.
         response: requests.Response = requests.Response()
-        try:
-            response: requests.Response = api_request(url)
-        except Exception:
-            logging.error(f"Error making request: {url}")
+
+        if not testing_url_format:
+            try:
+                response = requests.get(url)
+                #   The html confirmation has a return in it.
+                if response.status_code != 200:
+                    LOGGER.error(f"{table_label}: BAD REQUEST - resp: "
+                        + f"({response.status_code}")
+                    counters[3] += 1
+                    # No need to parse the response text if not 200.
+                    continue
+
+            except Exception:
+                logging.error(f"{table_label}: Error making request: {url}")
+                continue
 
         # Format response text for logging messages.
-        # The html confirmation has a return in it.
-        if response.status_code != 200:
-            logger.error(f"BAD REQUEST - resp: ({response.status_code}")
-            counters[3] += 1
-            # No need to parse the response text if not 200.
-            continue
-
-        log_msg, counters = parse_response_text(
+        log_msg, resp_log, counters = parse_response_text(
             response=response, counter_array=counters, url_string=url,
             testing_url=testing_url_format)
-        logger.debug(log_msg)
+        LOGGER.debug(f"{table_label}:{log_msg}")
 
+        dispositions.update({idx: (resp_log,)})
 
-    count_success, count_api_error, count_duplicates, count_bad_request = counters
+    count_success, count_api_error, count_duplicates, count_bad_request=\
+        counters
 
-    logger.info(
-        f"Added to Vici Dialer: {count_success}\n"
-        + f"Not Added: {count_api_error}/{count_duplicates} dups\n"
-        + f"Bad HTTP Requests: {count_bad_request}"
+    LOGGER.info(
+        '\n'
+        + f"{table_label}:\n"
+        + f"\tAdded to Vici Dialer: {count_success}\n"
+        + f"\tNot Added: {count_api_error}/{count_duplicates} dups\n"
+        + f"\tBad HTTP Requests: {count_bad_request}\n"
     )
+
+    # Output to backup CSV.
+    # Need to remove newlines from the comments field
+    results['comments'] = results['comments'].str.replace('\n', '||')
+    # Join dispos to csv for logging review.
+    out_path = Path(BACKUP_FILE_DIR) / f"{table_label}.csv"
+    results = results.join(Df.from_dict(
+            dispositions, orient='index', columns=['vici_log']
+        )['vici_log'])
+    results.to_csv(
+        path_or_buf=out_path,
+        index=False, encoding='utf-8'
+    )
+    LOGGER.info(f"{table_label}: Wrote {out_path.__str__()}")
 
     return
 
 
 def test():
     # == input CONSTANTS ===================>
-    # Set to True to print debugging messages to stdout
-    WE_ARE_DEBUGGING = True
-    # Set to True to avoid sending actual http requests, useful for debugging
-    # default should be False
-    TESTING_URL_FORMAT = True
     LIST_ID = 9999
     SQL_WHERE ="""--sql
-        WHERE l.status_id in (142, 143, 45)
+            AND l.status_id in (142, 143, 45)
             AND CONVERT_TZ(l.created, 'UTC', 'US/Central') >= '2022-10-01'
             AND src.val IN ('Google Paid Search', 'Bing', 'Phone In', 'Chat')
         GROUP BY l.id
         ORDER BY l.modified DESC
     """.replace('--sql\n', '')
     sql_where = re.sub(r' {8}', '', SQL_WHERE)
-    TABLE_LABEL = 'Test List'
-    # == input CONSTANTS ===================>
+    TABLE_LABEL = 'test_list'
+    TESTING_URL_FORMAT = True
 
+
+    # fields to update for each loop
+    ARGS_TO_USE: list[str] = [
+        'phone_number',
+        'first_name',
+        'last_name',
+        'comments',
+        'address1',
+        'address2',
+        'city',
+        'state',
+        'postal_code',
+        'email',
+        'MMS_Lead_ID',
+        'Company_Name',
+        'Lead_Source',
+        'Website',
+        'Lead_Owner',
+        'Vertical',
+        'Media_Market',
+    ]
+    # == input CONSTANTS ===================>
+    LOGGER.warning(f"*Running test*")
     load_to_vici(
         list_id=LIST_ID,
         table_label=TABLE_LABEL,
-        we_are_debugging=WE_ARE_DEBUGGING,
         testing_url_format=TESTING_URL_FORMAT,
         sql_where=sql_where,
+        params_to_use=ARGS_TO_USE
     )
+
 
 if __name__ == "__main__":
     test()

@@ -3,3 +3,4 @@ PM_LeadDialer.code-workspace
 __pycache__*
 *.log
 .env
+dialer_scratch.sql
