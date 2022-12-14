@@ -32,7 +32,7 @@ import numpy as np
 
 import requests
 
-from db_engines import mms_db as DB
+from db_engines import MMS_DB as DB
 
 from os import environ as os_environ
 from dotenv import load_dotenv
