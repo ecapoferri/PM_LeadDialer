@@ -1,7 +1,0 @@
-PM_LeadDialer.code-workspace
-.vscode
-__pycache__*
-*.log
-.env
-dialer_scratch.sql
-.gitignore
