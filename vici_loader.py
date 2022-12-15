@@ -37,10 +37,7 @@ from db_engines import MMS_DB as DB
 from os import environ as os_environ
 from dotenv import load_dotenv
 
-from MySQLdb._exceptions import\
-    OperationalError as MySQLdbOperationalError
 from sqlalchemy.engine.base import Engine as SqlalchemyConnEngine
-from typing import Iterable
 
 load_dotenv()
 
