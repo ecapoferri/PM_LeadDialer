@@ -1,3 +1,23 @@
+import logging
+from io import StringIO
+from pathlib import Path
+from urllib.parse import quote_plus
+import re
+from datetime import datetime, timedelta
+import pandas as pd
+from pandas import DataFrame as Df
+import numpy as np
+import traceback
+import requests
+
+from db_engines import MMS_DB as DB
+
+from os import environ as os_environ
+from dotenv import load_dotenv
+
+from sqlalchemy.engine.base import Engine as SqlalchemyConnEngine
+
+load_dotenv()
 """
 Generalized module to send dmp/lead query results to vici dialer.
 
@@ -20,34 +40,15 @@ Procedures:
         phone number.
     - provide logging feedback, verbose with debugging enabled.
 """
-import logging
-from io import StringIO
-from pathlib import Path
-from urllib.parse import quote_plus
-import re
-
-import pandas as pd
-from pandas import DataFrame as Df
-import numpy as np
-
-import requests
-
-from db_engines import MMS_DB as DB
-
-from os import environ as os_environ
-from dotenv import load_dotenv
-
-from sqlalchemy.engine.base import Engine as SqlalchemyConnEngine
-
-load_dotenv()
-
+SQL_DATE_FMT = r'%Y-%m-%d'
 SQL_SRC_FN = os_environ['PRMDIA_VICI_BASESQL_PATH']
-RE_SUB_PTN_LIMIT = r'\n*ORDER BY.*\n*LIMIT.*\n*;'
-RE_SUB_REPL_LIMIT = '\n\n-- Added lines below\n{}\n;'
 
 LOGGER_TOP_NAME = os_environ['PRMDIA_VICI_TOP_LOGGER']
 
 BACKUP_FILE_DIR = os_environ['PRMDIA_VICI_LIST_DUMP_DIR_PATH']
+
+VICI_UN: str = os_environ['PRMDIA_VICI_UN']
+VICI_PW: str = os_environ['PRMDIA_VICI_PW']
 
 # For url formatting, the 'safe' argument for urllib.parse.quote or .quote_plus.
 QUOTE_SAFE = '='
@@ -56,19 +57,26 @@ QUOTE_SAFE = '='
 ANSIRST = '\x1b[0m'
 ANSI_GREEN = '\x1b[32m'
 confirm_log_msg = (
-    f"\n{ANSI_GREEN}\t{'[URL]': >6}{ANSIRST}"
+    f"\n\t{'[URL]': >6}"
     + "\t{u}"
-    + f"\n{ANSI_GREEN}\t{'[Resp]': >6}{ANSIRST}"
+    + f"\n\t{'[Resp]': >6}"
     + "\t{response}\n"
 )
+# # This is an alternate version for stdout/stderr ouput, colorized.
+# confirm_log_msg = (
+#     f"\n{ANSI_GREEN}\t{'[URL]': >6}{ANSIRST}"
+#     + "\t{u}"
+#     + f"\n{ANSI_GREEN}\t{'[Resp]': >6}{ANSIRST}"
+#     + "\t{response}\n"
+# )
 
 # Constants for API requests.
 API_URL = os_environ['PRMDIA_VICI_API_URL']
 # These args stay the same for each url
 API_STATIC_ARGS_: dict[str, str | int] = {
-    'source': 'test',
-    'user': '6666',
-    'pass': 'RedLakeSky3501',
+    'source': quote_plus(__name__),
+    'user': VICI_UN,
+    'pass': VICI_PW,
     'function': 'add_lead',
     'custom_fields': 'Y',
     'duplicate_check': 'DUPLIST30DAY',
@@ -148,9 +156,30 @@ ALL_PARAMS: list[str] = [
 LOGGER = logging.getLogger(LOGGER_TOP_NAME)
 
 
+def parse_sql_query(where_date: str, sql_where: str) -> str:
+    RE_SUB_PTN_LIMIT =\
+        r'\n\s*AND l.status_id NOT IN \(100, 96, 144\)\n*ORDER BY.*\n*LIMIT.*\n*;'
+    RE_SUB_REPL_LIMIT =\
+        f"\n    AND l.status_id NOT IN (100, 96, 144)\n"\
+        + f"    AND l.created >= '{where_date}'\n-- Added lines below\n"\
+        + f"{sql_where}\n;"\
+            if len(where_date)\
+            else\
+        f"\n    AND l.status_id NOT IN (100, 96, 144)\n-- Added lines below\n{sql_where}\n;"
+
+    # Construct sql query
+    sql_base: str = Path(SQL_SRC_FN).read_text()
+    # This is so we can leave a LIMIT clause in our SQL file for testing.
+    # sql_base = re.sub(RE_SUB_PTN_LIMIT, RE_SUB_REPL_LIMIT, sql_base)
+    # query = sql_base.format(where_date=where_date, where_else=sql_where)
+    query = re.sub(RE_SUB_PTN_LIMIT, RE_SUB_REPL_LIMIT, sql_base)
+    LOGGER.debug(query)
+
+    return query
+
+
 def extract_from_db(
-            query: str,db: SqlalchemyConnEngine, table_label: str
-        ) -> Df:
+        query: str, db: SqlalchemyConnEngine, table_label: str) -> Df:
     """
     Args:
         query (str): Completed SQL query to get desired info from the
@@ -163,18 +192,22 @@ def extract_from_db(
         table_label (str): Used for logging feedback.
             Helpful to distinguish log messages while multithreading
             multiple instances of the main function in this module.
+        last_run_date (str): Date (UTC) to use a minimum for the query.
 
     Returns: pandas.Dataframe with desired results
     """
-    df_: Df
-    with DB.connect() as conn:
-        df_ = pd.read_sql_query(query, conn)
-    LOGGER.debug(f"{table_label}: df_ df: len, {len(df_)}")
-    log_buf = StringIO()
-    df_.info(buf=log_buf)
-    LOGGER.debug(f"{table_label}: Query df_ df, info:\n{log_buf.getvalue()}")
-    return df_
-
+    try:
+        df_: Df
+        with DB.connect() as conn:
+            df_ = pd.read_sql_query(query, conn)
+        LOGGER.info(f"{table_label}: df_ df: len, {len(df_)}")
+        log_buf = StringIO()
+        df_.info(buf=log_buf)
+        LOGGER.debug(f"{table_label}: Query df_ df, info:\n{log_buf.getvalue()}")
+        return df_
+    except Exception:
+        LOGGER.error(f"Error on query to DSB{traceback.format_exc()}")
+        raise ValueError(f"\nError on query to MMS DB. See traceback above")
 
 
 def process_df(df_: Df) -> Df:
@@ -371,6 +404,7 @@ def load_to_vici(
             list_id: int, sql_where: str,
             table_label: str,
             params_to_use: list[str],
+            where_date: str = '',
             testing_url_format: bool = False,
         ):
     """
@@ -380,6 +414,7 @@ def load_to_vici(
     Args:
         list_id (int): Vici list id
         sql_where (str): WHERE clauses to be added to base SQL query.
+        where_date (str): Minium date to be inserted into WHERE clauses.
         table_label (str): General Identifier for the specific list
             being queried from the lead DB.
         testing_url_format (bool, optional): To disable (if True)
@@ -394,18 +429,13 @@ def load_to_vici(
     LOGGER.info(f"{table_label}: Running...")
     LOGGER.debug(f"Table Label: {table_label}\n\tWe are debugging, fyi...")
     if testing_url_format:
-        LOGGER.debug(f"***Testing URL construction only. "
+        LOGGER.warning(f"***Testing URL construction only. "
             + f"No HTTP requests will be executed.***")
 
     # Add list ID to reusable args.
     api_static_args = API_STATIC_ARGS_ | {'list_id': str(list_id), }
 
-    # Construct sql query
-    sql_base_: str = Path(SQL_SRC_FN).read_text()
-    # This is so we can leave a LIMIT clause in our SQL file for testing.
-    sql_base = re.sub(RE_SUB_PTN_LIMIT, RE_SUB_REPL_LIMIT, sql_base_)
-    # del sql_base_
-    query = sql_base.format(sql_where)
+    query = parse_sql_query(where_date=where_date, sql_where=sql_where)
 
     # Extract df from DB and do some cleanup.
     results = (
@@ -415,7 +445,7 @@ def load_to_vici(
     if not len(results):
         LOGGER.error(
             f"{table_label}: No Results within filter conditions on this query")
-        raise ValueError(f"No ")
+        raise ValueError(f"No Results within filter conditions on this query")
 
     LOGGER.info(f"{len(results.index)} loaded from DB for {table_label}")
 
@@ -464,7 +494,7 @@ def load_to_vici(
         log_msg, resp_log, counters = parse_response_text(
             response=response, counter_array=counters, url_string=url,
             testing_url=testing_url_format)
-        LOGGER.debug(f"{table_label}:{log_msg}")
+        LOGGER.info(f"{table_label}:{log_msg}")
 
         dispositions.update({idx: (resp_log,)})
 
@@ -538,9 +568,12 @@ def test():
         table_label=TABLE_LABEL,
         testing_url_format=TESTING_URL_FORMAT,
         sql_where=sql_where,
+        where_date=(
+            datetime.utcnow().date() - timedelta(days=1)).strftime(r'%Y-%m-%d'),
         params_to_use=ARGS_TO_USE
     )
 
 
 if __name__ == "__main__":
+    LOGGER.setLevel(logging.DEBUG)
     test()
