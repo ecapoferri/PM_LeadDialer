@@ -1,23 +1,22 @@
 import logging
+import re
+import traceback
+from datetime import datetime, timedelta
 from io import StringIO
+from os import environ as os_environ
 from pathlib import Path
 from urllib.parse import quote_plus
-import re
-from datetime import datetime, timedelta
-import pandas as pd
-from pandas import DataFrame as Df
+
 import numpy as np
-import traceback
+import pandas as pd
 import requests
-
-from db_engines import MMS_DB as DB
-
-from os import environ as os_environ
 from dotenv import load_dotenv
-
+from pandas import DataFrame as Df
 from sqlalchemy.engine.base import Engine as SqlalchemyConnEngine
 
 load_dotenv()
+from db_engines import MMS_DB as DB
+
 """
 Generalized module to send dmp/lead query results to vici dialer.
 

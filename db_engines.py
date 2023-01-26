@@ -1,6 +1,6 @@
 import traceback
 from datetime import datetime
-from os import environ
+from os import environ as os_environ
 from pathlib import Path
 from sqlite3 import Row
 from typing import Any, Iterable, Literal
@@ -12,22 +12,36 @@ from pandas._typing import Dtype
 from sqlalchemy import create_engine
 from sqlalchemy.engine.base import Engine  # for type hints
 from sqlalchemy.types import TypeEngine
+import configparser
 
+ROOT_PATH = Path('/mnt/c/Users/ecapo/OneDrive/Documents/dev/Python/')
+APP_PATH = ROOT_PATH / 'PM_LeadDialer'
 load_dotenv()
+load_dotenv(Path(ROOT_PATH / '.env'))
 
-#MMS/WO=MySQL config/s==============>
-MMSWO_UN = environ['PRMDIA_SRVR_UN']
-MMSWO_PW = environ['PRMDIA_SRVR_PW']
-MMSWO_PORT = environ['PRMDIA_SRVR_DB_PORT']
-MMSWO_HOST = environ['PRMDIA_SRVR_DB_HOST']
-MMS_DB_NAME = environ['PRMDIA_SRVR_MMS_DB']
-#<==MMS/WO=MySQL config/s=================<
+conf = configparser.ConfigParser()
+conf.read(ROOT_PATH / 'app.conf')
+conf.read(ROOT_PATH / 'conn.conf')
+
+# MMS/WO=MySQL config/s==============>
+MMSWO_UN = os_environ['PRMDIA_SRVR_UN']
+MMSWO_PW = os_environ['PRMDIA_SRVR_PW']
+MMS_DB_NAME = conf['MYSQL']['MMS_DB']
+WO_DB_NAME = conf['MYSQL']['WO_DB']
+MMSWO_PORT = conf['MYSQL']['PORT']
+MMSWO_HOST = conf['MYSQL']['HOST']
+# <==MMS/WO=MySQL config/s=================<
 
 #==Connection Engines========>
 # connections to primedia dbs
 MMS_CONN_STR = (
     f"mysql+mysqldb://{MMSWO_UN}:{MMSWO_PW}"
     + f"@{MMSWO_HOST}:{MMSWO_PORT}/{MMS_DB_NAME}"
+)
+
+WO_CONN_STR = (
+    f"mysql+mysqldb://{MMSWO_UN}:{MMSWO_PW}"
+    + f"@{MMSWO_HOST}:{MMSWO_PORT}/{WO_DB_NAME}"
 )
 
 MMS_DB = create_engine(MMS_CONN_STR)
